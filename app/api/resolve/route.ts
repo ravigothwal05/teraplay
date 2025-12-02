@@ -4,13 +4,16 @@ import type {
     ResolveResponse
 } from '@/lib/types';
 import { validateTeraBoxUrl } from '@/lib/utils';
+import puppeteer from 'puppeteer';
 
 /**
  * POST /api/resolve
- * Resolves a TeraBox share link to direct video URLs
- * 100% custom implementation - no external APIs
+ * Resolves a TeraBox share link using browser automation (Puppeteer)
+ * This bypasses TeraBox's anti-bot protection by simulating a real browser
  */
 export async function POST(request: NextRequest) {
+    let browser = null;
+
     try {
         // Parse request body
         let body: ResolveRequest;
@@ -49,270 +52,232 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        console.log(`Resolving TeraBox URL: ${body.url}`);
+        console.log(`Resolving TeraBox URL with Puppeteer: ${body.url}`);
 
-        // Extract share parameters from URL
-        const urlParams = extractShareParams(body.url);
-        if (!urlParams.surl) {
-            return NextResponse.json(
-                { success: false, message: 'Invalid TeraBox share link format' },
-                { status: 400 }
-            );
+        // Launch headless browser with ad-blocker and security features disabled
+        browser = await puppeteer.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-extensions',
+                '--disable-plugins',
+                '--disable-popup-blocking',
+                '--ignore-certificate-errors'
+            ]
+        });
+
+        const page = await browser.newPage();
+
+        // Disable request blocking (ad blockers, etc.)
+        await page.setRequestInterception(true);
+        page.on('request', (request) => {
+            // Allow all requests - don't block anything
+            request.continue();
+        });
+
+        // Set realistic viewport and user agent
+        await page.setViewport({ width: 1920, height: 1080 });
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+        // Remove automation detection
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+            });
+        });
+
+        // Navigate to TeraBox share link
+        console.log('Navigating to TeraBox page...');
+        await page.goto(body.url, {
+            waitUntil: 'networkidle2',
+            timeout: 60000
+        });
+
+        // Wait for page to load
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        // Try to find video information on the page
+        console.log('Extracting video information...');
+
+        const videoInfo = await page.evaluate(() => {
+            // Try to extract file information from the page
+            const fileNameElement = document.querySelector('[class*="file-name"], [class*="fileName"], .filename, .file-name');
+            const fileSizeElement = document.querySelector('[class*="file-size"], [class*="fileSize"], .filesize, .file-size');
+
+            // Try to find video element and its source
+            const videoElements = document.querySelectorAll('video');
+            let videoSrc = null;
+            if (videoElements.length > 0) {
+                videoSrc = videoElements[0].src || videoElements[0].querySelector('source')?.src;
+            }
+
+            return {
+                fileName: fileNameElement?.textContent?.trim() || 'video.mp4',
+                fileSize: fileSizeElement?.textContent?.trim() || null,
+                videoSrc: videoSrc
+            };
+        });
+
+        console.log('Video info extracted:', videoInfo);
+
+        // If we found a video source, return it immediately
+        // Even if it's a streaming URL, it might work with proper CORS handling
+        if (videoInfo.videoSrc) {
+            const response: ResolveResponse = {
+                success: true,
+                fileName: videoInfo.fileName,
+                directUrl: videoInfo.videoSrc,
+                size: videoInfo.fileSize || undefined,
+                thumbnail: undefined,
+                qualities: undefined
+            };
+
+            await browser.close();
+            console.log('Successfully resolved TeraBox link with streaming URL');
+            return NextResponse.json(response, { status: 200 });
         }
 
-        // Step 1: Get share information from TeraBox
-        const shareInfo = await getShareInfo(urlParams.surl);
+        // Look for download button and click it to get the actual download URL
+        console.log('Looking for download button...');
 
-        if (!shareInfo.success) {
-            return NextResponse.json(
-                { success: false, message: shareInfo.message || 'Unable to access this TeraBox link. This may be due to network restrictions on your system.' },
-                { status: 502 }
-            );
+        try {
+            // Wait for download button to appear
+            await page.waitForSelector('a[href*="download"], button:has-text("Download"), [class*="download-btn"]', { timeout: 10000 });
+
+            // Click the download button
+            const downloadButton = await page.$('a[href*="download"], button:has-text("Download"), [class*="download-btn"]');
+
+            if (downloadButton) {
+                console.log('Found download button, clicking...');
+
+                // Set up request interception to catch the download URL
+                const downloadUrl = await new Promise<string>((resolve) => {
+                    page.on('response', async (response) => {
+                        const url = response.url();
+                        const contentType = response.headers()['content-type'] || '';
+
+                        // Look for actual video file URLs (not streaming URLs)
+                        if ((contentType.includes('video') || url.includes('.mp4')) &&
+                            !url.includes('streaming') &&
+                            !url.includes('m3u8')) {
+                            console.log('Found direct video URL:', url);
+                            resolve(url);
+                        }
+
+                        // Also check for download redirect URLs
+                        if (url.includes('download') && response.status() === 302) {
+                            const location = response.headers()['location'];
+                            if (location) {
+                                console.log('Found download redirect:', location);
+                                resolve(location);
+                            }
+                        }
+                    });
+
+                    // Click the button
+                    downloadButton.click();
+
+                    // Timeout after 10 seconds
+                    setTimeout(() => resolve(''), 10000);
+                });
+
+                if (downloadUrl) {
+                    const response: ResolveResponse = {
+                        success: true,
+                        fileName: videoInfo.fileName,
+                        directUrl: downloadUrl,
+                        size: videoInfo.fileSize || undefined,
+                        thumbnail: undefined,
+                        qualities: undefined
+                    };
+
+                    await browser.close();
+                    console.log('Successfully resolved TeraBox link via download button');
+                    return NextResponse.json(response, { status: 200 });
+                }
+            }
+        } catch (error) {
+            console.log('Download button not found or click failed:', error);
         }
 
-        // Find the first video file
-        const videoFile = findFirstVideo(shareInfo.list || []);
-        if (!videoFile) {
-            return NextResponse.json(
-                { success: false, message: 'No video files found in this TeraBox link' },
-                { status: 404 }
-            );
+        // If download button approach didn't work, try to extract from page API calls
+        console.log('Trying to extract download URL from page API...');
+
+        const apiUrl = await page.evaluate(() => {
+            // Try to find the download API endpoint in page scripts
+            const scripts = Array.from(document.querySelectorAll('script'));
+            for (const script of scripts) {
+                const content = script.textContent || '';
+                // Look for download API patterns
+                const match = content.match(/download[^"']*["']([^"']+)/i);
+                if (match) {
+                    return match[1];
+                }
+            }
+            return null;
+        });
+
+        if (apiUrl) {
+            console.log('Found API URL:', apiUrl);
+            // Try to call the API
+            try {
+                const apiResponse = await page.evaluate(async (url) => {
+                    const response = await fetch(url);
+                    return await response.json();
+                }, apiUrl);
+
+                console.log('API Response:', apiResponse);
+
+                if (apiResponse && apiResponse.dlink) {
+                    const response: ResolveResponse = {
+                        success: true,
+                        fileName: videoInfo.fileName,
+                        directUrl: apiResponse.dlink,
+                        size: videoInfo.fileSize || undefined,
+                        thumbnail: undefined,
+                        qualities: undefined
+                    };
+
+                    await browser.close();
+                    console.log('Successfully resolved TeraBox link via API');
+                    return NextResponse.json(response, { status: 200 });
+                }
+            } catch (error) {
+                console.log('API call failed:', error);
+            }
         }
 
-        // Step 2: Get download link for the video
-        const downloadInfo = await getDownloadLink(
-            shareInfo.shareid,
-            shareInfo.uk,
-            videoFile.fs_id,
-            shareInfo.sign,
-            shareInfo.timestamp
+        // If all else fails, return error
+        await browser.close();
+        return NextResponse.json(
+            { success: false, message: 'Unable to extract direct download URL from this TeraBox link. The link may require authentication or be private.' },
+            { status: 404 }
         );
 
-        if (!downloadInfo.success || !downloadInfo.dlink) {
-            return NextResponse.json(
-                { success: false, message: 'Unable to generate download link for this video' },
-                { status: 502 }
-            );
+    } catch (error) {
+        // Clean up browser if it's still open
+        if (browser) {
+            try {
+                await browser.close();
+            } catch (closeError) {
+                console.error('Error closing browser:', closeError);
+            }
         }
 
-        // Format file size
-        const formatSize = (bytes: number): string => {
-            if (!bytes) return '';
-            const mb = bytes / (1024 * 1024);
-            if (mb < 1024) return `${mb.toFixed(2)} MB`;
-            return `${(mb / 1024).toFixed(2)} GB`;
-        };
-
-        // Build response
-        const response: ResolveResponse = {
-            success: true,
-            fileName: videoFile.server_filename || videoFile.path || 'video.mp4',
-            directUrl: downloadInfo.dlink,
-            size: videoFile.size ? formatSize(videoFile.size) : undefined,
-            thumbnail: videoFile.thumbs?.url3 || videoFile.thumbs?.url2 || videoFile.thumbs?.url1 || undefined,
-            qualities: undefined, // TeraBox typically provides single quality
-        };
-
-        console.log('Successfully resolved TeraBox link');
-        return NextResponse.json(response, { status: 200 });
-
-    } catch (error) {
         // Catch-all for unexpected errors
         console.error('Unexpected error in /api/resolve:', error);
         return NextResponse.json(
-            { success: false, message: 'An unexpected error occurred. Please try again later.' },
+            { success: false, message: 'An unexpected error occurred while processing the TeraBox link. Please try again later.' },
             { status: 500 }
         );
     }
-}
-
-/**
- * Extract share parameters from TeraBox URL
- */
-function extractShareParams(url: string): { surl: string | null } {
-    try {
-        const urlObj = new URL(url);
-
-        // Extract surl from path (e.g., /s/1abc123)
-        const pathMatch = urlObj.pathname.match(/\/s\/([a-zA-Z0-9_-]+)/);
-        if (pathMatch) {
-            return { surl: pathMatch[1] };
-        }
-
-        // Extract from query parameter
-        const surl = urlObj.searchParams.get('surl');
-        if (surl) {
-            return { surl };
-        }
-
-        return { surl: null };
-    } catch (error) {
-        console.error('Failed to parse URL:', error);
-        return { surl: null };
-    }
-}
-
-/**
- * Get share information from TeraBox API
- * Uses Node.js fetch with custom configuration to handle SSL/TLS issues
- */
-async function getShareInfo(surl: string): Promise<any> {
-    try {
-        const apiUrl = 'https://www.terabox.com/share/list';
-
-        const params = new URLSearchParams({
-            shorturl: surl,
-            root: '1',
-            page: '1',
-            num: '20',
-            order: 'time',
-            desc: '1',
-            web: '1',
-            channel: 'dubox',
-            app_id: '250528',
-            jsToken: generateJsToken(),
-        });
-
-        // Use undici fetch with custom dispatcher to bypass SSL issues
-        const response = await fetch(`${apiUrl}?${params.toString()}`, {
-            method: 'GET',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': `https://www.terabox.com/s/1${surl}`,
-                'Connection': 'keep-alive',
-            },
-            signal: AbortSignal.timeout(30000),
-            // @ts-ignore - Next.js specific fetch options
-            cache: 'no-store',
-        });
-
-        if (!response.ok) {
-            console.error(`TeraBox API returned status ${response.status}`);
-            return { success: false, message: 'Unable to access TeraBox API' };
-        }
-
-        const data = await response.json();
-
-        if (data.errno !== 0) {
-            console.error('TeraBox API error:', data);
-            return { success: false, message: 'This link may be private or invalid' };
-        }
-
-        return {
-            success: true,
-            list: data.list || [],
-            shareid: data.shareid,
-            uk: data.uk,
-            sign: data.sign,
-            timestamp: data.timestamp,
-        };
-    } catch (error) {
-        console.error('Failed to get share info:', error);
-        if (error instanceof Error) {
-            if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-                return { success: false, message: 'Request timeout' };
-            }
-            if (error.message.includes('ECONNRESET') || error.message.includes('fetch failed')) {
-                return {
-                    success: false,
-                    message: 'Network connection error. This is likely due to Windows firewall or SSL/TLS restrictions. Please try deploying to Vercel or use a VPN.'
-                };
-            }
-        }
-        return { success: false, message: 'Network error' };
-    }
-}
-
-/**
- * Get download link from TeraBox API
- */
-async function getDownloadLink(
-    shareid: string,
-    uk: string,
-    fsId: string,
-    sign: string,
-    timestamp: string
-): Promise<any> {
-    try {
-        const apiUrl = 'https://www.terabox.com/share/download';
-
-        const params = new URLSearchParams({
-            shareid: shareid,
-            uk: uk,
-            fid_list: `[${fsId}]`,
-            sign: sign,
-            timestamp: timestamp,
-            web: '1',
-            channel: 'dubox',
-            app_id: '250528',
-            jsToken: generateJsToken(),
-        });
-
-        const response = await fetch(`${apiUrl}?${params.toString()}`, {
-            method: 'GET',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://www.terabox.com/',
-                'Connection': 'keep-alive',
-            },
-            signal: AbortSignal.timeout(30000),
-            // @ts-ignore - Next.js specific fetch options
-            cache: 'no-store',
-        });
-
-        if (!response.ok) {
-            console.error(`TeraBox download API returned status ${response.status}`);
-            return { success: false };
-        }
-
-        const data = await response.json();
-
-        if (data.errno !== 0 || !data.list || data.list.length === 0) {
-            console.error('TeraBox download API error:', data);
-            return { success: false };
-        }
-
-        return {
-            success: true,
-            dlink: data.list[0].dlink,
-        };
-    } catch (error) {
-        console.error('Failed to get download link:', error);
-        return { success: false };
-    }
-}
-
-/**
- * Find the first video file in the list (recursively)
- */
-function findFirstVideo(items: any[]): any {
-    for (const item of items) {
-        // Check if it's a video file
-        if (item.isdir === 0 && item.category === 1) { // category 1 = video
-            return item;
-        }
-        // Recursively search in subdirectories
-        if (item.isdir === 1 && item.children && item.children.length > 0) {
-            const found = findFirstVideo(item.children);
-            if (found) return found;
-        }
-    }
-    return null;
-}
-
-/**
- * Generate a simple jsToken for API requests
- */
-function generateJsToken(): string {
-    // Simple token generation - TeraBox may not strictly validate this
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let token = '';
-    for (let i = 0; i < 32; i++) {
-        token += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return token;
 }

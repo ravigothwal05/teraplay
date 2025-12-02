@@ -97,6 +97,7 @@ export default function VideoPlayer({
                     preload="metadata"
                     className="w-full h-full"
                     style={{ aspectRatio: '16/9' }}
+                    crossOrigin="anonymous"
                 >
                     <source src={currentUrl} type="video/mp4" />
                     Your browser does not support the video tag.
@@ -115,8 +116,8 @@ export default function VideoPlayer({
                                 key={quality.label}
                                 onClick={() => handleQualityChange(quality)}
                                 className={`px-4 py-2 rounded-lg font-medium transition-colors ${selectedQuality === quality.label
-                                        ? 'bg-blue-600 text-white'
-                                        : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+                                    ? 'bg-blue-600 text-white'
+                                    : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
                                     }`}
                             >
                                 {quality.label}
